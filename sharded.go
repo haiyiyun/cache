@@ -26,7 +26,7 @@ type unexportedShardedCache struct {
 type shardedCache struct {
 	seed    uint32
 	m       uint32
-	cs      []*cache
+	cs      []*memorycache
 	janitor *shardedJanitor
 }
 
@@ -62,7 +62,7 @@ func djb33(seed uint32, k string) uint32 {
 	return d ^ (d >> 16)
 }
 
-func (sc *shardedCache) bucket(k string) *cache {
+func (sc *shardedCache) bucket(k string) *memorycache {
 	return sc.cs[djb33(sc.seed, k)%sc.m]
 }
 
@@ -166,10 +166,10 @@ func newShardedCache(n int, de time.Duration) *shardedCache {
 	sc := &shardedCache{
 		seed: seed,
 		m:    uint32(n),
-		cs:   make([]*cache, n),
+		cs:   make([]*memorycache, n),
 	}
 	for i := 0; i < n; i++ {
-		c := &cache{
+		c := &memorycache{
 			defaultExpiration: de,
 			items:             map[string]Item{},
 		}
