@@ -39,7 +39,7 @@ func New(defaultExpiration, cleanupInterval time.Duration) Cache {
 
 	switch cacheType {
 	case "redis":
-		redisURL := os.Getenv("HYY_REDIS_URL")
+		redisURL := os.Getenv("HYY_CACHE_URL")
 		if redisURL == "" {
 			redisURL = "redis://localhost:6379/0"
 		}
