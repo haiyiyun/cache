@@ -1259,6 +1259,16 @@ func (c *RedisCache) getTyped(k string, target interface{}) (bool, int64, error)
 		return false, 0, err
 	}
 
+	// 处理结构体转换
+	if targetType.Kind() == reflect.Struct {
+		if objMap, ok := obj.(map[string]interface{}); ok {
+			if err := c.mapToStruct(objMap, target); err != nil {
+				return false, 0, fmt.Errorf("struct conversion failed: %w", err)
+			}
+			return true, fullItem.Expiration, nil
+		}
+	}
+
 	// 检查目标类型是否为切片
 	if targetType.Kind() == reflect.Slice {
 		found, err := c.handleSliceConversion(obj, targetValue, targetType)
@@ -1326,14 +1336,165 @@ func (c *RedisCache) handleSliceConversion(obj interface{}, targetValue reflect.
 
 // 将 map 转换为结构体
 func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) error {
-	// 使用 msgpack 序列化 map
-	data, err := msgpack.Marshal(m)
-	if err != nil {
-		return err
+	targetValue := reflect.ValueOf(target)
+	if targetValue.Kind() != reflect.Ptr || targetValue.IsNil() {
+		return errors.New("target must be a non-nil pointer to a struct")
 	}
 
-	// 反序列化到目标结构体
-	return msgpack.Unmarshal(data, target)
+	targetElem := targetValue.Elem()
+	if targetElem.Kind() != reflect.Struct {
+		return errors.New("target must be a pointer to a struct")
+	}
+
+	// 使用反射设置字段
+	targetType := targetElem.Type()
+	for i := 0; i < targetType.NumField(); i++ {
+		field := targetType.Field(i)
+		fieldName := field.Name
+
+		// 获取 msgpack 标签（如果有）
+		tag := field.Tag.Get("msgpack")
+		if tag != "" {
+			if parts := strings.Split(tag, ","); len(parts) > 0 {
+				if parts[0] != "" {
+					fieldName = parts[0]
+				}
+			}
+		}
+
+		// 从 map 中获取值
+		value, exists := m[fieldName]
+		if !exists {
+			// 尝试小写字段名（Go 默认序列化使用小写）
+			value, exists = m[strings.ToLower(fieldName)]
+			if !exists {
+				continue
+			}
+		}
+
+		fieldValue := targetElem.Field(i)
+		if !fieldValue.CanSet() {
+			continue
+		}
+
+		// 设置字段值
+		if err := c.setFieldValue(fieldValue, value); err != nil {
+			return fmt.Errorf("field %s: %w", field.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// 设置字段值（处理类型转换）
+func (c *RedisCache) setFieldValue(field reflect.Value, value interface{}) error {
+	fieldType := field.Type()
+	valueType := reflect.TypeOf(value)
+
+	// 如果类型匹配，直接设置
+	if valueType.AssignableTo(fieldType) {
+		field.Set(reflect.ValueOf(value))
+		return nil
+	}
+
+	// 尝试转换基本类型
+	switch fieldType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if num, ok := value.(int64); ok {
+			field.SetInt(num)
+			return nil
+		}
+		if num, ok := value.(int); ok {
+			field.SetInt(int64(num))
+			return nil
+		}
+		if num, ok := value.(float64); ok {
+			field.SetInt(int64(num))
+			return nil
+		}
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if num, ok := value.(uint64); ok {
+			field.SetUint(num)
+			return nil
+		}
+		if num, ok := value.(int); ok && num >= 0 {
+			field.SetUint(uint64(num))
+			return nil
+		}
+		if num, ok := value.(int64); ok && num >= 0 {
+			field.SetUint(uint64(num))
+			return nil
+		}
+		if num, ok := value.(float64); ok && num >= 0 {
+			field.SetUint(uint64(num))
+			return nil
+		}
+
+	case reflect.Float32, reflect.Float64:
+		if num, ok := value.(float64); ok {
+			field.SetFloat(num)
+			return nil
+		}
+		if num, ok := value.(int); ok {
+			field.SetFloat(float64(num))
+			return nil
+		}
+		if num, ok := value.(int64); ok {
+			field.SetFloat(float64(num))
+			return nil
+		}
+
+	case reflect.String:
+		if str, ok := value.(string); ok {
+			field.SetString(str)
+			return nil
+		}
+
+	case reflect.Bool:
+		if b, ok := value.(bool); ok {
+			field.SetBool(b)
+			return nil
+		}
+
+	case reflect.Struct:
+		// 处理嵌套结构体
+		if valueMap, ok := value.(map[string]interface{}); ok {
+			newField := reflect.New(fieldType)
+			if err := c.mapToStruct(valueMap, newField.Interface()); err != nil {
+				return err
+			}
+			field.Set(newField.Elem())
+			return nil
+		}
+
+	case reflect.Slice:
+		// 处理切片
+		sliceValue := reflect.ValueOf(value)
+		if sliceValue.Kind() != reflect.Slice {
+			return fmt.Errorf("expected slice, got %s", sliceValue.Kind())
+		}
+
+		newSlice := reflect.MakeSlice(fieldType, sliceValue.Len(), sliceValue.Len())
+		for i := 0; i < sliceValue.Len(); i++ {
+			elem := sliceValue.Index(i).Interface()
+			if err := c.setFieldValue(newSlice.Index(i), elem); err != nil {
+				return fmt.Errorf("slice element %d: %w", i, err)
+			}
+		}
+		field.Set(newSlice)
+		return nil
+	}
+
+	// 尝试直接转换
+	valueValue := reflect.ValueOf(value)
+	if valueValue.Type().ConvertibleTo(fieldType) {
+		converted := valueValue.Convert(fieldType)
+		field.Set(converted)
+		return nil
+	}
+
+	return fmt.Errorf("cannot convert %s to %s", valueType, fieldType)
 }
 
 // Increment 增加数值类型
