@@ -596,25 +596,19 @@ func (c *RedisCache) renewLock(lockKey, lockValue string) {
 	ticker := time.NewTicker(lockRenewInterval)
 	defer ticker.Stop()
 
-	renewCount := 0
 	for {
 		select {
 		case <-ticker.C:
-			c.lockHolderMutex.Lock()
-			holder, exists := c.lockHolders[lockKey]
-			c.lockHolderMutex.Unlock()
+			// 使用事务确保原子性
+			renewed, err := c.client.Eval(c.ctx, `
+                if redis.call("GET", KEYS[1]) == ARGV[1] then
+                    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+                else
+                    return 0
+                end
+            `, []string{lockKey}, lockValue, lockTimeout.Milliseconds()).Bool()
 
-			if !exists || holder.value != lockValue {
-				return
-			}
-
-			renewed, err := c.client.Expire(c.ctx, lockKey, lockTimeout).Result()
 			if err != nil || !renewed {
-				return
-			}
-
-			renewCount++
-			if renewCount >= maxRenewCount {
 				return
 			}
 
@@ -745,15 +739,23 @@ func (c *RedisCache) checkConnection() {
 }
 
 func (c *RedisCache) reconnect() {
-	// 实现重连逻辑
-	for i := 0; i < 5; i++ {
-		if _, err := c.client.Ping(c.ctx).Result(); err == nil {
-			log.Errorln("Redis connection reestablished")
+	backoff := 100 * time.Millisecond
+	maxBackoff := 30 * time.Second
+
+	for {
+		select {
+		case <-c.ctx.Done():
 			return
+		default:
+			if _, err := c.client.Ping(c.ctx).Result(); err == nil {
+				log.Errorln("Redis connection reestablished")
+				return
+			}
+
+			time.Sleep(backoff)
+			backoff = time.Duration(math.Min(float64(maxBackoff), float64(backoff*2)))
 		}
-		time.Sleep(time.Duration(i) * time.Second)
 	}
-	log.Fatal("Failed to reconnect to Redis after multiple attempts")
 }
 
 // 辅助函数
@@ -823,7 +825,12 @@ func (c *RedisCache) loadScripts() error {
 		end
 		
 		if tracker ~= "" then
-			redis.call("SADD", tracker, key)
+			local expirationMs = tonumber(ARGV[2])
+			if expirationMs > 0 then
+				redis.call("ZADD", tracker, "NX", expirationMs/1000, key)
+			else
+				redis.call("SADD", tracker, key)
+			end
 		end
 		
 		return 1
