@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"math/rand"
 	"net"
@@ -20,6 +19,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/haiyiyun/log"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -489,7 +490,7 @@ func (c *RedisCache) serializeWithCompression(item Item) ([]byte, error) {
 			return append([]byte{1}, compressed...), nil
 		}
 		// 压缩失败时返回原始数据
-		log.Printf("compression failed: %v, using uncompressed data", err)
+		log.Errorf("compression failed: %v, using uncompressed data", err)
 	}
 
 	// 未压缩数据添加未压缩标记
@@ -727,14 +728,14 @@ func (c *RedisCache) checkConnection() {
 		select {
 		case <-ticker.C:
 			if _, err := c.client.Ping(c.ctx).Result(); err != nil {
-				log.Printf("Redis connection lost: %v", err)
+				log.Errorf("Redis connection lost: %v", err)
 				c.reconnect()
 			}
 
 			// 检查连接池状态
 			poolStats := c.client.PoolStats()
 			if poolStats.Hits == 0 && poolStats.Misses > 100 {
-				log.Println("Redis connection pool may be starved")
+				log.Errorln("Redis connection pool may be starved")
 			}
 
 		case <-c.ctx.Done():
@@ -747,7 +748,7 @@ func (c *RedisCache) reconnect() {
 	// 实现重连逻辑
 	for i := 0; i < 5; i++ {
 		if _, err := c.client.Ping(c.ctx).Result(); err == nil {
-			log.Println("Redis connection reestablished")
+			log.Errorln("Redis connection reestablished")
 			return
 		}
 		time.Sleep(time.Duration(i) * time.Second)
@@ -1158,7 +1159,7 @@ func (c *RedisCache) Items() map[string]Item {
 			}
 
 			if err != nil {
-				log.Printf("Error scanning keys: %v", err)
+				log.Errorf("Error scanning keys: %v", err)
 				break
 			}
 
@@ -1166,7 +1167,7 @@ func (c *RedisCache) Items() map[string]Item {
 			if len(keys) > 0 {
 				values, err := c.client.MGet(c.ctx, keys...).Result()
 				if err != nil {
-					log.Printf("Error getting values: %v", err)
+					log.Errorf("Error getting values: %v", err)
 				} else {
 					for i, val := range values {
 						if val == nil {
@@ -1180,7 +1181,7 @@ func (c *RedisCache) Items() map[string]Item {
 
 						item, err := c.deserializeWithCompression([]byte(strVal))
 						if err != nil {
-							log.Printf("Deserialization error for key %s: %v", keys[i], err)
+							log.Errorf("Deserialization error for key %s: %v", keys[i], err)
 							continue
 						}
 
@@ -1203,7 +1204,7 @@ func (c *RedisCache) Items() map[string]Item {
 		// 共享DB模式 - 使用键追踪集合
 		keys, err := c.client.SMembers(c.ctx, c.keyTrackerSet).Result()
 		if err != nil {
-			log.Printf("Error getting keys from tracker: %v", err)
+			log.Errorf("Error getting keys from tracker: %v", err)
 			return items
 		}
 
@@ -1218,7 +1219,7 @@ func (c *RedisCache) Items() map[string]Item {
 			batch := keys[i:end]
 			values, err := c.client.MGet(c.ctx, batch...).Result()
 			if err != nil {
-				log.Printf("Error getting batch values: %v", err)
+				log.Errorf("Error getting batch values: %v", err)
 				continue
 			}
 
@@ -1234,7 +1235,7 @@ func (c *RedisCache) Items() map[string]Item {
 
 				item, err := c.deserializeWithCompression([]byte(strVal))
 				if err != nil {
-					log.Printf("Deserialization error for key %s: %v", batch[j], err)
+					log.Errorf("Deserialization error for key %s: %v", batch[j], err)
 					continue
 				}
 
