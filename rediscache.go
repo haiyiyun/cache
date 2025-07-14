@@ -14,77 +14,91 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/haiyiyun/log"
-
 	"github.com/redis/go-redis/v9"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-/*
-RedisCache 实现分布式安全的Redis缓存
+// 类型注册系统
+var typeRegistry = struct {
+	sync.RWMutex
+	types    map[string]reflect.Type
+	names    map[reflect.Type]string
+	encoders map[reflect.Type]func(interface{}) ([]byte, error) // 修改为函数类型
+	decoders map[reflect.Type]func([]byte) (interface{}, error) // 修改为函数类型
+}{
+	types:    make(map[string]reflect.Type),
+	names:    make(map[reflect.Type]string),
+	encoders: make(map[reflect.Type]func(interface{}) ([]byte, error)),
+	decoders: make(map[reflect.Type]func([]byte) (interface{}, error)),
+}
 
-URL 格式支持：
-1. 单节点模式：
-   redis://[username:password@]host[:port][/dbnumber]
-   示例:
-     redis://localhost:6379/0
-     redis://user:pass@redis.example.com:6380/1
+// 注册自定义类型
+func RegisterType(name string, typ interface{}) {
+	t := reflect.TypeOf(typ)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
 
-2. 哨兵模式：
-   redis-sentinel://[username:password@]host1:port1,host2:port2[?master=name&db=dbnumber]
-   示例:
-     redis-sentinel://sentinel1:26379,sentinel2:26379?master=mymaster&db=0
+	typeRegistry.Lock()
+	defer typeRegistry.Unlock()
 
-3. 集群模式：
-   redis-cluster://[username:password@]host1:port1,host2:port2[?db=dbnumber]
-   示例:
-     redis-cluster://cluster-node1:6379,cluster-node2:6379,cluster-node3:6379
+	typeRegistry.types[name] = t
+	typeRegistry.names[t] = name
+}
 
-4. TLS 加密连接：
-   使用 rediss:// 协议前缀：
-   rediss://[username:password@]host[:port][/dbnumber][?insecureSkipVerify=true]
-   示例:
-     rediss://secure.redis.com:6379/0
-     rediss://user:pass@redis.example.com:6380/1?tlsCAFile=ca.pem
+// 注册自定义编码器/解码器
+func RegisterCodec(typ interface{},
+	encoder func(interface{}) ([]byte, error),
+	decoder func([]byte) (interface{}, error)) {
 
-5. 高级参数：
-   所有模式都支持以下查询参数：
-   - poolsize: 连接池大小 (默认 100)
-   - shareddb: 是否共享数据库 (true/false, 默认 false)
-   - compression: 是否启用压缩 (true/false, 默认 false)
-   - compression_threshold: 压缩阈值字节数 (默认 1024)
-   - namespace: 缓存命名空间
-   - connect_timeout: 连接超时 (如 5s)
-   - read_timeout: 读取超时 (如 3s)
-   - write_timeout: 写入超时 (如 3s)
-   - min_retry_backoff: 最小重试间隔 (如 100ms)
-   - max_retry_backoff: 最大重试间隔 (如 2s)
-   - max_retries: 最大重试次数 (默认 3)
+	t := reflect.TypeOf(typ)
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
 
-TLS 参数：
-   - tlsCAFile: CA 证书文件路径
-   - tlsCertFile: 客户端证书文件路径
-   - tlsKeyFile: 客户端私钥文件路径
-   - insecureSkipVerify: 是否跳过证书验证 (true/false)
+	typeRegistry.Lock()
+	defer typeRegistry.Unlock()
 
-Redis 服务器强制配置要求：
-1. 必须启用键空间通知功能，配置示例：
-   notify-keyspace-events "Ex"
+	typeRegistry.encoders[t] = encoder
+	typeRegistry.decoders[t] = decoder
+}
 
-2. 当使用集群模式时，确保所有节点配置一致
-3. 若使用持久化，建议配置为：
-   appendonly yes
-   appendfsync everysec
+// 序列化包装器
+type serializedObject struct {
+	Type  string      `msgpack:"t"` // 类型标识符
+	Value interface{} `msgpack:"v"` // 原始值
+}
 
-4. 内存管理建议设置最大内存限制：
-   maxmemory 2gb
-   maxmemory-policy allkeys-lru
-*/
+// 初始化基本类型
+func init() {
+	RegisterType("int", 0)
+	RegisterType("int8", int8(0))
+	RegisterType("int16", int16(0))
+	RegisterType("int32", int32(0))
+	RegisterType("int64", int64(0))
+	RegisterType("uint", uint(0))
+	RegisterType("uint8", uint8(0))
+	RegisterType("uint16", uint16(0))
+	RegisterType("uint32", uint32(0))
+	RegisterType("uint64", uint64(0))
+	RegisterType("float32", float32(0))
+	RegisterType("float64", float64(0))
+	RegisterType("bool", false)
+	RegisterType("string", "")
+	RegisterType("time.Time", time.Time{})
+	RegisterType("[]byte", []byte{})
+	RegisterType("[]int", []int{})
+	RegisterType("[]string", []string{})
+	RegisterType("map[string]string", map[string]string{})
+	RegisterType("map[string]interface{}", map[string]interface{}{})
+}
 
 // RedisCache 实现分布式安全的Redis缓存
 type RedisCache struct {
@@ -109,6 +123,7 @@ type RedisCache struct {
 	namespace            string
 	isSharedDB           bool
 	keyTrackerSet        string
+	typeCache            sync.Map // 类型反射缓存
 }
 
 type lockHolder struct {
@@ -454,23 +469,153 @@ func (c *RedisCache) generateKey(key string) string {
 	return key
 }
 
-// 使用 msgpack 的序列化函数
-func (c *RedisCache) serialize(item Item) ([]byte, error) {
-	return msgpack.Marshal(item)
-}
+// 序列化对象（使用自定义包装器）
+func (c *RedisCache) serializeObject(obj interface{}) ([]byte, error) {
+	// 获取类型名称
+	typeName := ""
+	if obj != nil {
+		t := reflect.TypeOf(obj)
+		if t.Kind() == reflect.Ptr {
+			t = t.Elem()
+		}
 
-// 使用 msgpack 的反序列化函数
-func (c *RedisCache) deserialize(data []byte) (Item, error) {
-	var item Item
-	if err := msgpack.Unmarshal(data, &item); err != nil {
-		return Item{}, err
+		typeRegistry.RLock()
+		name, exists := typeRegistry.names[t]
+		typeRegistry.RUnlock()
+
+		if !exists {
+			name = t.String()
+		}
+		typeName = name
 	}
-	return item, nil
+
+	// 创建序列化对象
+	wrapper := serializedObject{
+		Type:  typeName,
+		Value: obj,
+	}
+
+	// 序列化
+	return msgpack.Marshal(wrapper)
 }
 
-// 带压缩的序列化 (保持原有压缩逻辑)
+// 反序列化对象（使用自定义包装器）
+func (c *RedisCache) deserializeObject(data []byte) (interface{}, error) {
+	var wrapper serializedObject
+	if err := msgpack.Unmarshal(data, &wrapper); err != nil {
+		return nil, err
+	}
+
+	// 如果没有类型信息，直接返回值
+	if wrapper.Type == "" {
+		return wrapper.Value, nil
+	}
+
+	// 获取类型
+	typeRegistry.RLock()
+	typ, exists := typeRegistry.types[wrapper.Type]
+	typeRegistry.RUnlock()
+
+	if !exists {
+		// 尝试从字符串解析类型
+		if typ = c.resolveTypeFromString(wrapper.Type); typ == nil {
+			return wrapper.Value, nil
+		}
+	}
+
+	// 创建目标类型的实例
+	target := reflect.New(typ).Interface()
+
+	// 使用自定义解码器（如果存在）
+	typeRegistry.RLock()
+	decoder, hasDecoder := typeRegistry.decoders[typ]
+	typeRegistry.RUnlock()
+
+	if hasDecoder {
+		// 将wrapper.Value序列化为字节，然后使用自定义解码器
+		valueBytes, err := msgpack.Marshal(wrapper.Value)
+		if err != nil {
+			return nil, err
+		}
+
+		return decoder(valueBytes)
+	}
+
+	// 标准解码：将值映射到目标类型
+	valueBytes, err := msgpack.Marshal(wrapper.Value)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := msgpack.Unmarshal(valueBytes, target); err != nil {
+		return nil, err
+	}
+
+	// 解引用指针
+	if reflect.TypeOf(target).Kind() == reflect.Ptr {
+		return reflect.ValueOf(target).Elem().Interface(), nil
+	}
+
+	return target, nil
+}
+
+// 从类型字符串解析反射类型
+func (c *RedisCache) resolveTypeFromString(typeStr string) reflect.Type {
+	// 检查类型缓存
+	if typ, ok := c.typeCache.Load(typeStr); ok {
+		return typ.(reflect.Type)
+	}
+
+	// 尝试解析类型
+	parts := strings.Split(typeStr, ".")
+	if len(parts) < 2 {
+		return nil
+	}
+
+	// 获取包路径和类型名
+	pkgPath := strings.Join(parts[:len(parts)-1], ".")
+	typeName := parts[len(parts)-1]
+
+	// 使用反射查找类型
+	var foundType reflect.Type
+	reflectTypes := []reflect.Type{
+		reflect.TypeOf((*error)(nil)).Elem(),
+		reflect.TypeOf((*interface{})(nil)).Elem(),
+	}
+
+	for _, rt := range reflectTypes {
+		if rt.PkgPath() == pkgPath && rt.Name() == typeName {
+			foundType = rt
+			break
+		}
+	}
+
+	// 缓存结果
+	if foundType != nil {
+		c.typeCache.Store(typeStr, foundType)
+	}
+
+	return foundType
+}
+
+// 带压缩的序列化
 func (c *RedisCache) serializeWithCompression(item Item) ([]byte, error) {
-	data, err := c.serialize(item)
+	// 序列化对象部分
+	objData, err := c.serializeObject(item.Object)
+	if err != nil {
+		return nil, err
+	}
+
+	// 创建完整Item的序列化数据
+	fullItem := struct {
+		Object     []byte `msgpack:"o"`
+		Expiration int64  `msgpack:"e"`
+	}{
+		Object:     objData,
+		Expiration: item.Expiration,
+	}
+
+	data, err := msgpack.Marshal(fullItem)
 	if err != nil {
 		return nil, err
 	}
@@ -486,24 +631,49 @@ func (c *RedisCache) serializeWithCompression(item Item) ([]byte, error) {
 	return append([]byte{0}, data...), nil
 }
 
-// 带解压的反序列化 (保持原有压缩逻辑)
+// 带解压的反序列化
 func (c *RedisCache) deserializeWithCompression(data []byte) (Item, error) {
 	if len(data) == 0 {
 		return Item{}, errors.New("empty data")
 	}
 
+	// 第一个字节是压缩标记
 	flag := data[0]
 	payload := data[1:]
 
+	var decompressed []byte
+	var err error
+
+	// 如果是压缩数据则解压
 	if flag == 1 {
-		decompressed, err := decompressData(payload)
+		decompressed, err = decompressData(payload)
 		if err != nil {
 			return Item{}, fmt.Errorf("decompression failed: %w", err)
 		}
-		return c.deserialize(decompressed)
+	} else {
+		decompressed = payload
 	}
 
-	return c.deserialize(payload)
+	// 解析完整Item结构
+	var fullItem struct {
+		Object     []byte `msgpack:"o"`
+		Expiration int64  `msgpack:"e"`
+	}
+
+	if err := msgpack.Unmarshal(decompressed, &fullItem); err != nil {
+		return Item{}, err
+	}
+
+	// 反序列化对象
+	obj, err := c.deserializeObject(fullItem.Object)
+	if err != nil {
+		return Item{}, err
+	}
+
+	return Item{
+		Object:     obj,
+		Expiration: fullItem.Expiration,
+	}, nil
 }
 
 // 压缩数据
@@ -582,19 +752,25 @@ func (c *RedisCache) renewLock(lockKey, lockValue string) {
 	ticker := time.NewTicker(lockRenewInterval)
 	defer ticker.Stop()
 
+	renewCount := 0
 	for {
 		select {
 		case <-ticker.C:
-			// 使用事务确保原子性
-			renewed, err := c.client.Eval(c.ctx, `
-                if redis.call("GET", KEYS[1]) == ARGV[1] then
-                    return redis.call("PEXPIRE", KEYS[1], ARGV[2])
-                else
-                    return 0
-                end
-            `, []string{lockKey}, lockValue, lockTimeout.Milliseconds()).Bool()
+			c.lockHolderMutex.Lock()
+			holder, exists := c.lockHolders[lockKey]
+			c.lockHolderMutex.Unlock()
 
+			if !exists || holder.value != lockValue {
+				return
+			}
+
+			renewed, err := c.client.Expire(c.ctx, lockKey, lockTimeout).Result()
 			if err != nil || !renewed {
+				return
+			}
+
+			renewCount++
+			if renewCount >= maxRenewCount {
 				return
 			}
 
@@ -725,23 +901,15 @@ func (c *RedisCache) checkConnection() {
 }
 
 func (c *RedisCache) reconnect() {
-	backoff := 100 * time.Millisecond
-	maxBackoff := 30 * time.Second
-
-	for {
-		select {
-		case <-c.ctx.Done():
+	// 实现重连逻辑
+	for i := 0; i < 5; i++ {
+		if _, err := c.client.Ping(c.ctx).Result(); err == nil {
+			log.Errorln("Redis connection reestablished")
 			return
-		default:
-			if _, err := c.client.Ping(c.ctx).Result(); err == nil {
-				log.Errorln("Redis connection reestablished")
-				return
-			}
-
-			time.Sleep(backoff)
-			backoff = time.Duration(math.Min(float64(maxBackoff), float64(backoff*2)))
 		}
+		time.Sleep(time.Duration(i) * time.Second)
 	}
+	log.Fatal("Failed to reconnect to Redis after multiple attempts")
 }
 
 // 辅助函数
@@ -811,12 +979,7 @@ func (c *RedisCache) loadScripts() error {
 		end
 		
 		if tracker ~= "" then
-			local expirationMs = tonumber(ARGV[2])
-			if expirationMs > 0 then
-				redis.call("ZADD", tracker, "NX", expirationMs/1000, key)
-			else
-				redis.call("SADD", tracker, key)
-			end
+			redis.call("SADD", tracker, key)
 		end
 		
 		return 1
@@ -890,23 +1053,22 @@ func (c *RedisCache) getScript(name string) *redis.Script {
 
 // Set 添加项目到缓存
 func (c *RedisCache) Set(k string, x interface{}, d time.Duration) error {
-	return c.setWithMode(k, x, d, "set")
-}
-
-// SetDefault 使用默认过期时间添加项目
-func (c *RedisCache) SetDefault(k string, x interface{}) error {
-	return c.Set(k, x, DefaultExpiration)
-}
-
-// setWithMode 支持不同模式的设置操作
-func (c *RedisCache) setWithMode(k string, x interface{}, d time.Duration, mode string) error {
 	if d == DefaultExpiration {
 		d = c.defaultExpiration
 	}
 
+	var expiration int64
+	if d > 0 {
+		expiration = time.Now().Add(d).UnixNano()
+	} else if d == NoExpiration {
+		expiration = 0
+	} else {
+		expiration = 0
+	}
+
 	item := Item{
 		Object:     x,
-		Expiration: 0,
+		Expiration: expiration,
 	}
 
 	data, err := c.serializeWithCompression(item)
@@ -931,72 +1093,247 @@ func (c *RedisCache) setWithMode(k string, x interface{}, d time.Duration, mode 
 	}
 
 	_, err = script.Run(c.ctx, c.client, []string{fullKey},
-		data, expirationMs, mode, c.keyTrackerSet).Result()
+		data, expirationMs, "set", c.keyTrackerSet).Result()
 	return err
+}
+
+// SetDefault 使用默认过期时间添加项目
+func (c *RedisCache) SetDefault(k string, x interface{}) error {
+	return c.Set(k, x, DefaultExpiration)
 }
 
 // Add 仅当键不存在时添加项目
 func (c *RedisCache) Add(k string, x interface{}, d time.Duration) error {
-	return c.setWithMode(k, x, d, "add")
+	if d == DefaultExpiration {
+		d = c.defaultExpiration
+	}
+
+	var expiration int64
+	if d > 0 {
+		expiration = time.Now().Add(d).UnixNano()
+	} else if d == NoExpiration {
+		expiration = 0
+	} else {
+		expiration = 0
+	}
+
+	item := Item{
+		Object:     x,
+		Expiration: expiration,
+	}
+
+	data, err := c.serializeWithCompression(item)
+	if err != nil {
+		return err
+	}
+
+	var expirationMs int64
+	if d > 0 {
+		expirationMs = int64(d / time.Millisecond)
+	} else if d == NoExpiration {
+		expirationMs = -1
+	} else {
+		expirationMs = 0
+	}
+
+	fullKey := c.generateKey(k)
+
+	script := c.getScript("set_script")
+	if script == nil {
+		return errors.New("set script not found")
+	}
+
+	_, err = script.Run(c.ctx, c.client, []string{fullKey},
+		data, expirationMs, "add", c.keyTrackerSet).Result()
+	return err
 }
 
 // Replace 仅当键存在时替换项目
 func (c *RedisCache) Replace(k string, x interface{}, d time.Duration) error {
-	return c.setWithMode(k, x, d, "replace")
+	if d == DefaultExpiration {
+		d = c.defaultExpiration
+	}
+
+	var expiration int64
+	if d > 0 {
+		expiration = time.Now().Add(d).UnixNano()
+	} else if d == NoExpiration {
+		expiration = 0
+	} else {
+		expiration = 0
+	}
+
+	item := Item{
+		Object:     x,
+		Expiration: expiration,
+	}
+
+	data, err := c.serializeWithCompression(item)
+	if err != nil {
+		return err
+	}
+
+	var expirationMs int64
+	if d > 0 {
+		expirationMs = int64(d / time.Millisecond)
+	} else if d == NoExpiration {
+		expirationMs = -1
+	} else {
+		expirationMs = 0
+	}
+
+	fullKey := c.generateKey(k)
+
+	script := c.getScript("set_script")
+	if script == nil {
+		return errors.New("set script not found")
+	}
+
+	_, err = script.Run(c.ctx, c.client, []string{fullKey},
+		data, expirationMs, "replace", c.keyTrackerSet).Result()
+	return err
 }
 
-// Get 获取项目
-func (c *RedisCache) Get(k string) (interface{}, bool) {
-	fullKey := c.generateKey(k)
-	item, found, err := c.getItem(fullKey)
-	if err != nil || !found {
-		return nil, false
-	}
-	return item.Object, true
+func (c *RedisCache) Get(k string, target interface{}) (bool, error) {
+	found, _, err := c.getTyped(k, target)
+	return found, err
 }
 
 // GetWithExpiration 获取项目及其过期时间
-func (c *RedisCache) GetWithExpiration(k string) (interface{}, time.Time, bool) {
-	fullKey := c.generateKey(k)
-	item, found, err := c.getItem(fullKey)
-	if err != nil || !found {
-		return nil, time.Time{}, false
+func (c *RedisCache) GetWithExpiration(k string, target interface{}) (bool, time.Time) {
+	found, expiration, _ := c.getTyped(k, target)
+	if expiration > 0 {
+		return found, time.Unix(0, expiration)
 	}
 
-	ttl, err := c.client.TTL(c.ctx, fullKey).Result()
-	if err != nil {
-		return item.Object, time.Time{}, true
-	}
-
-	expiration := time.Time{}
-	if ttl > 0 {
-		expiration = time.Now().Add(ttl)
-	}
-
-	return item.Object, expiration, true
+	return found, time.Time{}
 }
 
-// getItem 内部方法获取项目
-func (c *RedisCache) getItem(fullKey string) (Item, bool, error) {
+// getTyped 类型安全获取
+func (c *RedisCache) getTyped(k string, target interface{}) (bool, int64, error) {
+	fullKey := c.generateKey(k)
 	data, err := c.client.Get(c.ctx, fullKey).Bytes()
 	if err != nil {
 		if err == redis.Nil {
-			return Item{}, false, nil
+			return false, 0, nil
 		}
-		return Item{}, false, err
+		return false, 0, err
 	}
 
-	item, err := c.deserializeWithCompression(data)
+	// 处理压缩数据
+	if len(data) > 0 {
+		flag := data[0]
+		payload := data[1:]
+
+		if flag == 1 {
+			decompressed, err := decompressData(payload)
+			if err != nil {
+				return false, 0, fmt.Errorf("decompression failed: %w", err)
+			}
+			data = decompressed
+		} else {
+			data = payload
+		}
+	}
+
+	// 解析完整Item结构
+	var fullItem struct {
+		Object     []byte `msgpack:"o"`
+		Expiration int64  `msgpack:"e"`
+	}
+
+	if err := msgpack.Unmarshal(data, &fullItem); err != nil {
+		return false, 0, err
+	}
+
+	// 获取目标类型
+	targetValue := reflect.ValueOf(target)
+	if targetValue.Kind() != reflect.Ptr || targetValue.IsNil() {
+		return false, 0, errors.New("target must be a non-nil pointer")
+	}
+	targetType := targetValue.Type().Elem()
+
+	// 反序列化对象
+	obj, err := c.deserializeObject(fullItem.Object)
 	if err != nil {
-		return Item{}, false, err
+		return false, 0, err
 	}
 
-	if item.Expired() {
-		c.Delete(fullKey)
-		return Item{}, false, nil
+	// 检查目标类型是否为切片
+	if targetType.Kind() == reflect.Slice {
+		found, err := c.handleSliceConversion(obj, targetValue, targetType)
+		return found, fullItem.Expiration, err
 	}
 
-	return item, true, nil
+	// 验证类型
+	objType := reflect.TypeOf(obj)
+	if objType != targetType {
+		return false, 0, fmt.Errorf("type mismatch: expected %s, got %s",
+			targetType.String(), objType.String())
+	}
+
+	targetValue.Elem().Set(reflect.ValueOf(obj))
+	return true, fullItem.Expiration, nil
+}
+
+// 处理切片类型转换
+func (c *RedisCache) handleSliceConversion(obj interface{}, targetValue reflect.Value, targetType reflect.Type) (bool, error) {
+	// 获取目标切片的元素类型
+	elemType := targetType.Elem()
+
+	// 检查对象是否为切片
+	objValue := reflect.ValueOf(obj)
+	if objValue.Kind() != reflect.Slice {
+		return false, fmt.Errorf("expected slice, got %s", objValue.Kind())
+	}
+
+	// 创建目标切片
+	newSlice := reflect.MakeSlice(targetType, objValue.Len(), objValue.Len())
+
+	// 转换每个元素
+	for i := 0; i < objValue.Len(); i++ {
+		elem := objValue.Index(i).Interface()
+
+		// 如果元素已经是目标类型，直接赋值
+		if reflect.TypeOf(elem) == elemType {
+			newSlice.Index(i).Set(reflect.ValueOf(elem))
+			continue
+		}
+
+		// 尝试转换 map 到结构体
+		if elemMap, ok := elem.(map[string]interface{}); ok && elemType.Kind() == reflect.Struct {
+			if err := c.mapToStruct(elemMap, newSlice.Index(i).Addr().Interface()); err != nil {
+				return false, fmt.Errorf("element %d conversion failed: %w", i, err)
+			}
+			continue
+		}
+
+		// 尝试直接转换
+		elemValue := reflect.ValueOf(elem)
+		if elemValue.Type().ConvertibleTo(elemType) {
+			converted := elemValue.Convert(elemType)
+			newSlice.Index(i).Set(converted)
+			continue
+		}
+
+		return false, fmt.Errorf("element %d type mismatch: expected %s, got %s",
+			i, elemType.String(), reflect.TypeOf(elem).String())
+	}
+
+	targetValue.Elem().Set(newSlice)
+	return true, nil
+}
+
+// 将 map 转换为结构体
+func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) error {
+	// 使用 msgpack 序列化 map
+	data, err := msgpack.Marshal(m)
+	if err != nil {
+		return err
+	}
+
+	// 反序列化到目标结构体
+	return msgpack.Unmarshal(data, target)
 }
 
 // Increment 增加数值类型
@@ -1122,139 +1459,6 @@ func (c *RedisCache) stopEvictionListener() {
 	c.evictionStop = make(chan struct{})
 }
 
-// Items 获取所有项目
-func (c *RedisCache) Items() map[string]Item {
-	items := make(map[string]Item)
-
-	// 在独用DB模式下，直接扫描整个DB
-	if !c.isSharedDB {
-		var cursor uint64
-		for {
-			var keys []string
-			var err error
-
-			// 根据客户端类型使用不同的扫描方法
-			switch client := c.client.(type) {
-			case *redis.ClusterClient:
-				// 集群模式 - 遍历所有主节点
-				err = client.ForEachMaster(c.ctx, func(ctx context.Context, node *redis.Client) error {
-					scanKeys, nextCursor, e := node.Scan(ctx, cursor, "*", 1000).Result()
-					if e != nil {
-						return e
-					}
-					keys = append(keys, scanKeys...)
-					cursor = nextCursor
-					return nil
-				})
-			default:
-				// 单节点或Sentinel模式
-				keys, cursor, err = c.client.Scan(c.ctx, cursor, "*", 1000).Result()
-			}
-
-			if err != nil {
-				log.Errorf("Error scanning keys: %v", err)
-				break
-			}
-
-			// 批量获取值
-			if len(keys) > 0 {
-				values, err := c.client.MGet(c.ctx, keys...).Result()
-				if err != nil {
-					log.Errorf("Error getting values: %v", err)
-				} else {
-					for i, val := range values {
-						if val == nil {
-							continue
-						}
-
-						strVal, ok := val.(string)
-						if !ok {
-							continue
-						}
-
-						item, err := c.deserializeWithCompression([]byte(strVal))
-						if err != nil {
-							log.Errorf("Deserialization error for key %s: %v", keys[i], err)
-							continue
-						}
-
-						if item.Expired() {
-							c.Delete(keys[i])
-							continue
-						}
-
-						// 在独用模式下，键名就是原始键名
-						items[keys[i]] = item
-					}
-				}
-			}
-
-			if cursor == 0 {
-				break
-			}
-		}
-	} else {
-		// 共享DB模式 - 使用键追踪集合
-		keys, err := c.client.SMembers(c.ctx, c.keyTrackerSet).Result()
-		if err != nil {
-			log.Errorf("Error getting keys from tracker: %v", err)
-			return items
-		}
-
-		// 批量获取值
-		batchSize := 100
-		for i := 0; i < len(keys); i += batchSize {
-			end := i + batchSize
-			if end > len(keys) {
-				end = len(keys)
-			}
-
-			batch := keys[i:end]
-			values, err := c.client.MGet(c.ctx, batch...).Result()
-			if err != nil {
-				log.Errorf("Error getting batch values: %v", err)
-				continue
-			}
-
-			for j, val := range values {
-				if val == nil {
-					continue
-				}
-
-				strVal, ok := val.(string)
-				if !ok {
-					continue
-				}
-
-				item, err := c.deserializeWithCompression([]byte(strVal))
-				if err != nil {
-					log.Errorf("Deserialization error for key %s: %v", batch[j], err)
-					continue
-				}
-
-				if item.Expired() {
-					c.Delete(batch[j])
-					continue
-				}
-
-				// 在共享模式下，需要移除命名空间前缀
-				userKey := strings.TrimPrefix(batch[j], c.namespace+":")
-				items[userKey] = item
-			}
-		}
-	}
-
-	return items
-}
-
-func (c *RedisCache) Interfaces() map[string]interface{} {
-	items := make(map[string]interface{})
-	for k, item := range c.Items() {
-		items[k] = item.Object
-	}
-	return items
-}
-
 // ItemCount 获取项目数量
 func (c *RedisCache) ItemCount() int {
 	// 在独用DB模式下，使用DBSIZE命令
@@ -1318,24 +1522,4 @@ func (c *RedisCache) Close() {
 	}
 
 	c.client.Close()
-}
-
-// Save 保存缓存到文件 - 不支持
-func (c *RedisCache) Save(w io.Writer) error {
-	return errors.New("not supported in RedisCache")
-}
-
-// SaveFile 保存缓存到文件 - 不支持
-func (c *RedisCache) SaveFile(fname string) error {
-	return errors.New("not supported in RedisCache")
-}
-
-// Load 从文件加载缓存 - 不支持
-func (c *RedisCache) Load(r io.Reader) error {
-	return errors.New("not supported in RedisCache")
-}
-
-// LoadFile 从文件加载缓存 - 不支持
-func (c *RedisCache) LoadFile(fname string) error {
-	return errors.New("not supported in RedisCache")
 }

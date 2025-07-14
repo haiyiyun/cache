@@ -2,7 +2,6 @@ package cache
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"time"
 )
@@ -13,8 +12,8 @@ type Cache interface {
 	SetDefault(k string, x interface{}) error
 	Add(k string, x interface{}, d time.Duration) error
 	Replace(k string, x interface{}, d time.Duration) error
-	Get(k string) (interface{}, bool)
-	GetWithExpiration(k string) (interface{}, time.Time, bool)
+	Get(k string, target interface{}) (bool, error)
+	GetWithExpiration(k string, target interface{}) (bool, time.Time)
 	Increment(k string, n int64) error
 	IncrementFloat(k string, n float64) error
 	Decrement(k string, n int64) error
@@ -22,12 +21,6 @@ type Cache interface {
 	Delete(k string)
 	DeleteExpired()
 	OnEvicted(f func(string, interface{}))
-	Save(w io.Writer) error
-	SaveFile(fname string) error
-	Load(r io.Reader) error
-	LoadFile(fname string) error
-	Items() map[string]Item
-	Interfaces() map[string]interface{}
 	ItemCount() int
 	Flush()
 	Close()
