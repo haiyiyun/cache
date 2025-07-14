@@ -6,6 +6,7 @@ require (
 	github.com/haiyiyun/log v0.0.0-20250714021242-243291bf2f88
 	github.com/redis/go-redis/v9 v9.11.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
+	go.mongodb.org/mongo-driver v1.17.4
 )
 
 require (

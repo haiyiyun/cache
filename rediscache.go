@@ -23,7 +23,69 @@ import (
 	"github.com/haiyiyun/log"
 	"github.com/redis/go-redis/v9"
 	"github.com/vmihailenco/msgpack/v5"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
+
+/*
+RedisCache 实现分布式安全的Redis缓存
+
+URL 格式支持：
+1. 单节点模式：
+   redis://[username:password@]host[:port][/dbnumber]
+   示例:
+     redis://localhost:6379/0
+     redis://user:pass@redis.example.com:6380/1
+
+2. 哨兵模式：
+   redis-sentinel://[username:password@]host1:port1,host2:port2[?master=name&db=dbnumber]
+   示例:
+     redis-sentinel://sentinel1:26379,sentinel2:26379?master=mymaster&db=0
+
+3. 集群模式：
+   redis-cluster://[username:password@]host1:port1,host2:port2[?db=dbnumber]
+   示例:
+     redis-cluster://cluster-node1:6379,cluster-node2:6379,cluster-node3:6379
+
+4. TLS 加密连接：
+   使用 rediss:// 协议前缀：
+   rediss://[username:password@]host[:port][/dbnumber][?insecureSkipVerify=true]
+   示例:
+     rediss://secure.redis.com:6379/0
+     rediss://user:pass@redis.example.com:6380/1?tlsCAFile=ca.pem
+
+5. 高级参数：
+   所有模式都支持以下查询参数：
+   - poolsize: 连接池大小 (默认 100)
+   - shareddb: 是否共享数据库 (true/false, 默认 false)
+   - compression: 是否启用压缩 (true/false, 默认 false)
+   - compression_threshold: 压缩阈值字节数 (默认 1024)
+   - namespace: 缓存命名空间
+   - connect_timeout: 连接超时 (如 5s)
+   - read_timeout: 读取超时 (如 3s)
+   - write_timeout: 写入超时 (如 3s)
+   - min_retry_backoff: 最小重试间隔 (如 100ms)
+   - max_retry_backoff: 最大重试间隔 (如 2s)
+   - max_retries: 最大重试次数 (默认 3)
+
+TLS 参数：
+   - tlsCAFile: CA 证书文件路径
+   - tlsCertFile: 客户端证书文件路径
+   - tlsKeyFile: 客户端私钥文件路径
+   - insecureSkipVerify: 是否跳过证书验证 (true/false)
+
+Redis 服务器强制配置要求：
+1. 必须启用键空间通知功能，配置示例：
+   notify-keyspace-events "Ex"
+
+2. 当使用集群模式时，确保所有节点配置一致
+3. 若使用持久化，建议配置为：
+   appendonly yes
+   appendfsync everysec
+
+4. 内存管理建议设置最大内存限制：
+   maxmemory 2gb
+   maxmemory-policy allkeys-lru
+*/
 
 // 类型注册系统
 var typeRegistry = struct {
@@ -98,6 +160,21 @@ func init() {
 	RegisterType("[]string", []string{})
 	RegisterType("map[string]string", map[string]string{})
 	RegisterType("map[string]interface{}", map[string]interface{}{})
+
+	RegisterType("primitive.ObjectID", primitive.ObjectID{})
+
+	RegisterCodec(primitive.ObjectID{},
+		func(obj interface{}) ([]byte, error) {
+			oid, ok := obj.(primitive.ObjectID)
+			if !ok {
+				return nil, errors.New("not an ObjectID")
+			}
+			return []byte(oid.Hex()), nil
+		},
+		func(data []byte) (interface{}, error) {
+			return primitive.ObjectIDFromHex(string(data))
+		},
+	)
 }
 
 // RedisCache 实现分布式安全的Redis缓存
@@ -1352,30 +1429,26 @@ func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) e
 		field := targetType.Field(i)
 		fieldName := field.Name
 
-		// 获取 msgpack 标签（如果有）
-		if tag := field.Tag.Get("msgpack"); tag != "" {
-			if parts := strings.Split(tag, ","); len(parts) > 0 {
-				if parts[0] != "" {
-					fieldName = parts[0]
-				}
+		// 优先使用 map 标签
+		if tag := field.Tag.Get("map"); tag != "" {
+			parts := strings.Split(tag, ",")
+			if parts[0] != "" {
+				fieldName = parts[0]
 			}
-		} else if tag := field.Tag.Get("map"); tag != "" {
-			if parts := strings.Split(tag, ","); len(parts) > 0 {
-				if parts[0] != "" {
-					fieldName = parts[0]
-				}
+		} else if tag := field.Tag.Get("msgpack"); tag != "" {
+			parts := strings.Split(tag, ",")
+			if parts[0] != "" {
+				fieldName = parts[0]
 			}
 		} else if tag := field.Tag.Get("json"); tag != "" {
-			if parts := strings.Split(tag, ","); len(parts) > 0 {
-				if parts[0] != "" {
-					fieldName = parts[0]
-				}
+			parts := strings.Split(tag, ",")
+			if parts[0] != "" {
+				fieldName = parts[0]
 			}
 		} else if tag := field.Tag.Get("bson"); tag != "" {
-			if parts := strings.Split(tag, ","); len(parts) > 0 {
-				if parts[0] != "" {
-					fieldName = parts[0]
-				}
+			parts := strings.Split(tag, ",")
+			if parts[0] != "" {
+				fieldName = parts[0]
 			}
 		}
 
@@ -1391,13 +1464,235 @@ func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) e
 
 		fieldValue := targetElem.Field(i)
 
-		// 设置字段值
-		if err := c.setFieldValue(fieldValue, value); err != nil {
+		// 深度递归处理嵌套结构体
+		if err := c.deepSetField(fieldValue, value); err != nil {
 			return fmt.Errorf("field %s: %w", field.Name, err)
 		}
 	}
 
 	return nil
+}
+
+// 深度递归设置字段值
+func (c *RedisCache) deepSetField(field reflect.Value, value interface{}) error {
+	// 处理 nil 值
+	if value == nil {
+		if field.CanSet() {
+			field.Set(reflect.Zero(field.Type()))
+		}
+		return nil
+	}
+
+	fieldType := field.Type()
+	valueType := reflect.TypeOf(value)
+
+	// 直接类型匹配
+	if valueType.AssignableTo(fieldType) {
+		field.Set(reflect.ValueOf(value))
+		return nil
+	}
+
+	// 处理指针类型
+	if fieldType.Kind() == reflect.Ptr {
+		if field.IsNil() {
+			field.Set(reflect.New(fieldType.Elem()))
+		}
+		return c.deepSetField(field.Elem(), value)
+	}
+
+	// 处理结构体类型
+	if fieldType.Kind() == reflect.Struct {
+		// 特殊处理：time.Time 类型
+		if fieldType == reflect.TypeOf(time.Time{}) {
+			return c.setTimeField(field, value)
+		}
+
+		// 处理嵌套结构体
+		if valueMap, ok := value.(map[string]interface{}); ok {
+			// 创建新的结构体实例
+			newField := reflect.New(fieldType)
+			if err := c.mapToStruct(valueMap, newField.Interface()); err != nil {
+				return err
+			}
+			field.Set(newField.Elem())
+			return nil
+		}
+	}
+
+	// 处理切片类型
+	if fieldType.Kind() == reflect.Slice {
+		sliceValue := reflect.ValueOf(value)
+		if sliceValue.Kind() != reflect.Slice {
+			return fmt.Errorf("expected slice, got %s", sliceValue.Kind())
+		}
+
+		// 创建目标类型的切片
+		newSlice := reflect.MakeSlice(fieldType, sliceValue.Len(), sliceValue.Len())
+		for i := 0; i < sliceValue.Len(); i++ {
+			elem := sliceValue.Index(i).Interface()
+			if err := c.deepSetField(newSlice.Index(i), elem); err != nil {
+				return fmt.Errorf("slice element %d: %w", i, err)
+			}
+		}
+		field.Set(newSlice)
+		return nil
+	}
+
+	// 处理 map 类型
+	if fieldType.Kind() == reflect.Map {
+		if valueMap, ok := value.(map[string]interface{}); ok {
+			// 确保键类型为 string
+			if fieldType.Key().Kind() != reflect.String {
+				return fmt.Errorf("map key must be string, got %s", fieldType.Key().Kind())
+			}
+
+			// 创建 map
+			newMap := reflect.MakeMap(fieldType)
+			elemType := fieldType.Elem()
+
+			for k, v := range valueMap {
+				// 创建元素值
+				elemValue := reflect.New(elemType).Elem()
+				if err := c.deepSetField(elemValue, v); err != nil {
+					return fmt.Errorf("map value for key %s: %w", k, err)
+				}
+				newMap.SetMapIndex(reflect.ValueOf(k), elemValue)
+			}
+			field.Set(newMap)
+			return nil
+		}
+	}
+
+	// 尝试类型转换
+	valueValue := reflect.ValueOf(value)
+	if valueValue.IsValid() && valueValue.Type().ConvertibleTo(fieldType) {
+		converted := valueValue.Convert(fieldType)
+		field.Set(converted)
+		return nil
+	}
+
+	// 处理基本类型转换
+	return c.convertBasicType(field, value)
+}
+
+// 设置 time.Time 字段
+func (c *RedisCache) setTimeField(field reflect.Value, value interface{}) error {
+	switch v := value.(type) {
+	case int64:
+		field.Set(reflect.ValueOf(time.Unix(0, v)))
+		return nil
+	case string:
+		t, err := time.Parse(time.RFC3339Nano, v)
+		if err != nil {
+			return fmt.Errorf("time parsing failed: %w", err)
+		}
+		field.Set(reflect.ValueOf(t))
+		return nil
+	case []byte:
+		t, err := time.Parse(time.RFC3339Nano, string(v))
+		if err != nil {
+			return err
+		}
+		field.Set(reflect.ValueOf(t))
+		return nil
+	default:
+		return fmt.Errorf("unsupported type for time.Time: %T", value)
+	}
+}
+
+// 转换基本类型
+func (c *RedisCache) convertBasicType(field reflect.Value, value interface{}) error {
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if num, ok := value.(int64); ok {
+			field.SetInt(num)
+			return nil
+		}
+		if num, ok := value.(int); ok {
+			field.SetInt(int64(num))
+			return nil
+		}
+		if num, ok := value.(float64); ok {
+			field.SetInt(int64(num))
+			return nil
+		}
+		if str, ok := value.(string); ok {
+			if num, err := strconv.ParseInt(str, 10, 64); err == nil {
+				field.SetInt(num)
+				return nil
+			}
+		}
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if num, ok := value.(uint64); ok {
+			field.SetUint(num)
+			return nil
+		}
+		if num, ok := value.(int); ok && num >= 0 {
+			field.SetUint(uint64(num))
+			return nil
+		}
+		if num, ok := value.(int64); ok && num >= 0 {
+			field.SetUint(uint64(num))
+			return nil
+		}
+		if num, ok := value.(float64); ok && num >= 0 {
+			field.SetUint(uint64(num))
+			return nil
+		}
+		if str, ok := value.(string); ok {
+			if num, err := strconv.ParseUint(str, 10, 64); err == nil {
+				field.SetUint(num)
+				return nil
+			}
+		}
+
+	case reflect.Float32, reflect.Float64:
+		if num, ok := value.(float64); ok {
+			field.SetFloat(num)
+			return nil
+		}
+		if num, ok := value.(int); ok {
+			field.SetFloat(float64(num))
+			return nil
+		}
+		if num, ok := value.(int64); ok {
+			field.SetFloat(float64(num))
+			return nil
+		}
+		if str, ok := value.(string); ok {
+			if num, err := strconv.ParseFloat(str, 64); err == nil {
+				field.SetFloat(num)
+				return nil
+			}
+		}
+
+	case reflect.String:
+		if str, ok := value.(string); ok {
+			field.SetString(str)
+			return nil
+		}
+		field.SetString(fmt.Sprint(value))
+		return nil
+
+	case reflect.Bool:
+		if b, ok := value.(bool); ok {
+			field.SetBool(b)
+			return nil
+		}
+		if str, ok := value.(string); ok {
+			if b, err := strconv.ParseBool(str); err == nil {
+				field.SetBool(b)
+				return nil
+			}
+		}
+		if num, ok := value.(int64); ok {
+			field.SetBool(num != 0)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("cannot convert %T to %s", value, field.Type())
 }
 
 // 设置字段值（处理类型转换）
