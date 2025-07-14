@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +22,7 @@ import (
 	"github.com/haiyiyun/log"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 /*
@@ -454,70 +454,56 @@ func (c *RedisCache) generateKey(key string) string {
 	return key
 }
 
-// 序列化函数
-func serialize(item Item) ([]byte, error) {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(item); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+// 使用 msgpack 的序列化函数
+func (c *RedisCache) serialize(item Item) ([]byte, error) {
+	return msgpack.Marshal(item)
 }
 
-// 反序列化函数
-func deserialize(data []byte) (Item, error) {
+// 使用 msgpack 的反序列化函数
+func (c *RedisCache) deserialize(data []byte) (Item, error) {
 	var item Item
-	buf := bytes.NewBuffer(data)
-	dec := gob.NewDecoder(buf)
-	if err := dec.Decode(&item); err != nil {
+	if err := msgpack.Unmarshal(data, &item); err != nil {
 		return Item{}, err
 	}
 	return item, nil
 }
 
-// 带压缩的序列化
+// 带压缩的序列化 (保持原有压缩逻辑)
 func (c *RedisCache) serializeWithCompression(item Item) ([]byte, error) {
-	data, err := serialize(item)
+	data, err := c.serialize(item)
 	if err != nil {
 		return nil, err
 	}
 
-	// 如果启用压缩且数据大小超过阈值，则进行压缩
 	if c.compression && len(data) > c.compressionThreshold {
 		compressed, err := compressData(data)
 		if err == nil {
-			// 在压缩数据前添加压缩标记
 			return append([]byte{1}, compressed...), nil
 		}
-		// 压缩失败时返回原始数据
 		log.Errorf("compression failed: %v, using uncompressed data", err)
 	}
 
-	// 未压缩数据添加未压缩标记
 	return append([]byte{0}, data...), nil
 }
 
-// 带解压的反序列化
+// 带解压的反序列化 (保持原有压缩逻辑)
 func (c *RedisCache) deserializeWithCompression(data []byte) (Item, error) {
 	if len(data) == 0 {
 		return Item{}, errors.New("empty data")
 	}
 
-	// 第一个字节是压缩标记
 	flag := data[0]
 	payload := data[1:]
 
-	// 如果是压缩数据则解压
 	if flag == 1 {
 		decompressed, err := decompressData(payload)
 		if err != nil {
 			return Item{}, fmt.Errorf("decompression failed: %w", err)
 		}
-		return deserialize(decompressed)
+		return c.deserialize(decompressed)
 	}
 
-	// 未压缩数据直接反序列化
-	return deserialize(payload)
+	return c.deserialize(payload)
 }
 
 // 压缩数据
