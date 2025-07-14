@@ -1429,25 +1429,25 @@ func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) e
 		field := targetType.Field(i)
 		fieldName := field.Name
 
-		// 优先使用 map 标签
+		// 优先使用 map 标签（您的结构体使用了 map 标签）
 		if tag := field.Tag.Get("map"); tag != "" {
 			parts := strings.Split(tag, ",")
-			if parts[0] != "" {
+			if len(parts) > 0 && parts[0] != "" {
 				fieldName = parts[0]
 			}
 		} else if tag := field.Tag.Get("msgpack"); tag != "" {
 			parts := strings.Split(tag, ",")
-			if parts[0] != "" {
+			if len(parts) > 0 && parts[0] != "" {
 				fieldName = parts[0]
 			}
 		} else if tag := field.Tag.Get("json"); tag != "" {
 			parts := strings.Split(tag, ",")
-			if parts[0] != "" {
+			if len(parts) > 0 && parts[0] != "" {
 				fieldName = parts[0]
 			}
 		} else if tag := field.Tag.Get("bson"); tag != "" {
 			parts := strings.Split(tag, ",")
-			if parts[0] != "" {
+			if len(parts) > 0 && parts[0] != "" {
 				fieldName = parts[0]
 			}
 		}
@@ -1455,16 +1455,24 @@ func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) e
 		// 从 map 中获取值
 		value, exists := m[fieldName]
 		if !exists {
-			// 尝试小写字段名（Go 默认序列化使用小写）
-			value, exists = m[strings.ToLower(fieldName)]
+			// 尝试原始字段名
+			value, exists = m[field.Name]
 			if !exists {
-				continue
+				// 尝试小写字段名
+				value, exists = m[strings.ToLower(fieldName)]
+				if !exists {
+					// 尝试小写原始字段名
+					value, exists = m[strings.ToLower(field.Name)]
+					if !exists {
+						continue
+					}
+				}
 			}
 		}
 
 		fieldValue := targetElem.Field(i)
 
-		// 深度递归处理嵌套结构体
+		// 深度递归设置字段值
 		if err := c.deepSetField(fieldValue, value); err != nil {
 			return fmt.Errorf("field %s: %w", field.Name, err)
 		}
@@ -1475,6 +1483,8 @@ func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) e
 
 // 深度递归设置字段值
 func (c *RedisCache) deepSetField(field reflect.Value, value interface{}) error {
+	log.Debugf("Setting field: %s, kind: %s, value type: %T",
+		field.Type().String(), field.Kind().String(), value)
 	// 处理 nil 值
 	if value == nil {
 		if field.CanSet() {
@@ -1505,6 +1515,11 @@ func (c *RedisCache) deepSetField(field reflect.Value, value interface{}) error 
 		// 特殊处理：time.Time 类型
 		if fieldType == reflect.TypeOf(time.Time{}) {
 			return c.setTimeField(field, value)
+		}
+
+		// 特殊处理：primitive.ObjectID 类型
+		if fieldType == reflect.TypeOf(primitive.ObjectID{}) {
+			return c.setObjectIDField(field, value)
 		}
 
 		// 处理嵌套结构体
@@ -1597,6 +1612,31 @@ func (c *RedisCache) setTimeField(field reflect.Value, value interface{}) error 
 		return nil
 	default:
 		return fmt.Errorf("unsupported type for time.Time: %T", value)
+	}
+}
+
+// 设置 primitive.ObjectID 字段
+func (c *RedisCache) setObjectIDField(field reflect.Value, value interface{}) error {
+	switch v := value.(type) {
+	case string:
+		oid, err := primitive.ObjectIDFromHex(v)
+		if err != nil {
+			return fmt.Errorf("invalid ObjectID hex: %w", err)
+		}
+		field.Set(reflect.ValueOf(oid))
+		return nil
+	case []byte:
+		oid, err := primitive.ObjectIDFromHex(string(v))
+		if err != nil {
+			return fmt.Errorf("invalid ObjectID hex: %w", err)
+		}
+		field.Set(reflect.ValueOf(oid))
+		return nil
+	case primitive.ObjectID:
+		field.Set(reflect.ValueOf(v))
+		return nil
+	default:
+		return fmt.Errorf("unsupported type for primitive.ObjectID: %T", value)
 	}
 }
 
