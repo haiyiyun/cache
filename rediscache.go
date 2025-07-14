@@ -1353,8 +1353,25 @@ func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) e
 		fieldName := field.Name
 
 		// 获取 msgpack 标签（如果有）
-		tag := field.Tag.Get("msgpack")
-		if tag != "" {
+		if tag := field.Tag.Get("msgpack"); tag != "" {
+			if parts := strings.Split(tag, ","); len(parts) > 0 {
+				if parts[0] != "" {
+					fieldName = parts[0]
+				}
+			}
+		} else if tag := field.Tag.Get("map"); tag != "" {
+			if parts := strings.Split(tag, ","); len(parts) > 0 {
+				if parts[0] != "" {
+					fieldName = parts[0]
+				}
+			}
+		} else if tag := field.Tag.Get("json"); tag != "" {
+			if parts := strings.Split(tag, ","); len(parts) > 0 {
+				if parts[0] != "" {
+					fieldName = parts[0]
+				}
+			}
+		} else if tag := field.Tag.Get("bson"); tag != "" {
 			if parts := strings.Split(tag, ","); len(parts) > 0 {
 				if parts[0] != "" {
 					fieldName = parts[0]
@@ -1373,9 +1390,6 @@ func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) e
 		}
 
 		fieldValue := targetElem.Field(i)
-		if !fieldValue.CanSet() {
-			continue
-		}
 
 		// 设置字段值
 		if err := c.setFieldValue(fieldValue, value); err != nil {
@@ -1388,6 +1402,20 @@ func (c *RedisCache) mapToStruct(m map[string]interface{}, target interface{}) e
 
 // 设置字段值（处理类型转换）
 func (c *RedisCache) setFieldValue(field reflect.Value, value interface{}) error {
+	// 检查字段是否可设置
+	if !field.CanSet() {
+		return nil
+	}
+
+	// 处理 value 为 nil 的情况
+	if value == nil {
+		// 如果字段是指针类型，设置为 nil
+		if field.Kind() == reflect.Ptr || field.Kind() == reflect.Interface {
+			field.Set(reflect.Zero(field.Type()))
+		}
+		return nil
+	}
+
 	fieldType := field.Type()
 	valueType := reflect.TypeOf(value)
 
@@ -1412,6 +1440,12 @@ func (c *RedisCache) setFieldValue(field reflect.Value, value interface{}) error
 			field.SetInt(int64(num))
 			return nil
 		}
+		if str, ok := value.(string); ok {
+			if num, err := strconv.ParseInt(str, 10, 64); err == nil {
+				field.SetInt(num)
+				return nil
+			}
+		}
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		if num, ok := value.(uint64); ok {
@@ -1430,6 +1464,12 @@ func (c *RedisCache) setFieldValue(field reflect.Value, value interface{}) error
 			field.SetUint(uint64(num))
 			return nil
 		}
+		if str, ok := value.(string); ok {
+			if num, err := strconv.ParseUint(str, 10, 64); err == nil {
+				field.SetUint(num)
+				return nil
+			}
+		}
 
 	case reflect.Float32, reflect.Float64:
 		if num, ok := value.(float64); ok {
@@ -1444,22 +1484,60 @@ func (c *RedisCache) setFieldValue(field reflect.Value, value interface{}) error
 			field.SetFloat(float64(num))
 			return nil
 		}
+		if str, ok := value.(string); ok {
+			if num, err := strconv.ParseFloat(str, 64); err == nil {
+				field.SetFloat(num)
+				return nil
+			}
+		}
 
 	case reflect.String:
 		if str, ok := value.(string); ok {
 			field.SetString(str)
 			return nil
 		}
+		// 尝试将数字转换为字符串
+		if num, ok := value.(int64); ok {
+			field.SetString(strconv.FormatInt(num, 10))
+			return nil
+		}
+		if num, ok := value.(float64); ok {
+			field.SetString(strconv.FormatFloat(num, 'f', -1, 64))
+			return nil
+		}
+		if num, ok := value.(int); ok {
+			field.SetString(strconv.Itoa(num))
+			return nil
+		}
+		// 其他类型直接转换为字符串
+		field.SetString(fmt.Sprint(value))
+		return nil
 
 	case reflect.Bool:
 		if b, ok := value.(bool); ok {
 			field.SetBool(b)
 			return nil
 		}
+		if str, ok := value.(string); ok {
+			if b, err := strconv.ParseBool(str); err == nil {
+				field.SetBool(b)
+				return nil
+			}
+		}
+		if num, ok := value.(int64); ok {
+			field.SetBool(num != 0)
+			return nil
+		}
 
 	case reflect.Struct:
 		// 处理嵌套结构体
 		if valueMap, ok := value.(map[string]interface{}); ok {
+			// 确保字段是结构体类型
+			if fieldType.Kind() != reflect.Struct {
+				return fmt.Errorf("field is not a struct")
+			}
+
+			// 创建一个新的结构体实例
 			newField := reflect.New(fieldType)
 			if err := c.mapToStruct(valueMap, newField.Interface()); err != nil {
 				return err
@@ -1475,6 +1553,7 @@ func (c *RedisCache) setFieldValue(field reflect.Value, value interface{}) error
 			return fmt.Errorf("expected slice, got %s", sliceValue.Kind())
 		}
 
+		// 创建目标类型的切片
 		newSlice := reflect.MakeSlice(fieldType, sliceValue.Len(), sliceValue.Len())
 		for i := 0; i < sliceValue.Len(); i++ {
 			elem := sliceValue.Index(i).Interface()
@@ -1484,11 +1563,18 @@ func (c *RedisCache) setFieldValue(field reflect.Value, value interface{}) error
 		}
 		field.Set(newSlice)
 		return nil
+
+	case reflect.Ptr:
+		// 处理指针类型
+		if field.IsNil() {
+			field.Set(reflect.New(fieldType.Elem()))
+		}
+		return c.setFieldValue(field.Elem(), value)
 	}
 
 	// 尝试直接转换
 	valueValue := reflect.ValueOf(value)
-	if valueValue.Type().ConvertibleTo(fieldType) {
+	if valueValue.IsValid() && valueValue.Type().ConvertibleTo(fieldType) {
 		converted := valueValue.Convert(fieldType)
 		field.Set(converted)
 		return nil
