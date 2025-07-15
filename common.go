@@ -3,8 +3,8 @@ package cache
 import "time"
 
 type Item struct {
-	Object     interface{}
-	Expiration int64
+	Object     interface{} `msgpack:"o"`
+	Expiration int64       `msgpack:"e"`
 }
 
 // Returns true if the item has expired.
