@@ -443,9 +443,8 @@ func NewRedisCache(options RedisOptions, defaultExpiration time.Duration) (*Redi
 		options.Namespace = fmt.Sprintf("hyy_cache:%s:%d:%d", hostname, os.Getpid(), rand.Int63())
 	}
 
-	// 解析DNS地址
-	resolvedAddrs := resolveDNSAddresses(options.Addresses)
-	if len(resolvedAddrs) == 0 {
+	addresses := options.Addresses
+	if len(addresses) == 0 {
 		return nil, errors.New("no valid Redis addresses provided")
 	}
 
@@ -453,10 +452,10 @@ func NewRedisCache(options RedisOptions, defaultExpiration time.Duration) (*Redi
 	var client redis.UniversalClient
 
 	switch {
-	case len(resolvedAddrs) == 1 && options.MasterName == "":
+	case len(addresses) == 1 && options.MasterName == "":
 		// 单节点模式
 		client = redis.NewClient(&redis.Options{
-			Addr:            resolvedAddrs[0],
+			Addr:            addresses[0],
 			Username:        options.Username,
 			Password:        options.Password,
 			DB:              options.DB,
@@ -474,7 +473,7 @@ func NewRedisCache(options RedisOptions, defaultExpiration time.Duration) (*Redi
 		// Sentinel模式
 		client = redis.NewFailoverClient(&redis.FailoverOptions{
 			MasterName:      options.MasterName,
-			SentinelAddrs:   resolvedAddrs,
+			SentinelAddrs:   addresses,
 			Username:        options.Username,
 			Password:        options.Password,
 			DB:              options.DB,
@@ -491,7 +490,7 @@ func NewRedisCache(options RedisOptions, defaultExpiration time.Duration) (*Redi
 	default:
 		// 集群模式
 		client = redis.NewClusterClient(&redis.ClusterOptions{
-			Addrs:           resolvedAddrs,
+			Addrs:           addresses,
 			Username:        options.Username,
 			Password:        options.Password,
 			PoolSize:        options.PoolSize,
@@ -992,37 +991,6 @@ func (c *RedisCache) reconnect() {
 func generateLockID() string {
 	hostname, _ := os.Hostname()
 	return fmt.Sprintf("%s-%d-%d", hostname, os.Getpid(), rand.Int63())
-}
-
-func resolveDNSAddresses(addresses []string) []string {
-	var resolved []string
-	for _, addr := range addresses {
-		if strings.Contains(addr, "://") {
-			// 已经是IP地址或解析过的地址
-			resolved = append(resolved, addr)
-			continue
-		}
-
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			// 无效地址，跳过
-			resolved = append(resolved, addr)
-			continue
-		}
-
-		// 解析DNS
-		ips, err := net.LookupIP(host)
-		if err != nil || len(ips) == 0 {
-			resolved = append(resolved, addr)
-			continue
-		}
-
-		// 使用所有解析的IP
-		for _, ip := range ips {
-			resolved = append(resolved, net.JoinHostPort(ip.String(), port))
-		}
-	}
-	return resolved
 }
 
 // 预加载Lua脚本
