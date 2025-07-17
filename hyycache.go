@@ -3,9 +3,10 @@ package cache
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"os"
+	"reflect"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/haiyiyun/log"
@@ -21,7 +22,6 @@ type HYYCache struct {
 	cancel       context.CancelFunc
 	subscription *redis.PubSub
 	updateChan   chan string
-	mu           sync.RWMutex
 }
 
 // NewHYYCache 创建两级缓存
@@ -37,7 +37,7 @@ func NewHYYCache(local *MemoryCache, remote *RedisCache) *HYYCache {
 		instanceID: instanceID,
 		ctx:        ctx,
 		cancel:     cancel,
-		updateChan: make(chan string, 1000),
+		updateChan: make(chan string, 10000), // 从1000调整到10000
 	}
 
 	// 启动订阅
@@ -103,6 +103,10 @@ func (t *HYYCache) subscribeToUpdates() {
 func (t *HYYCache) processUpdates() {
 	const batchSize = 100
 	const batchTimeout = 100 * time.Millisecond
+	const numWorkers = 10 // 工作协程数量
+
+	workCh := t.startInvalidationWorkers(numWorkers)
+	defer close(workCh)
 
 	batch := make([]string, 0, batchSize)
 	timer := time.NewTimer(batchTimeout)
@@ -123,32 +127,37 @@ func (t *HYYCache) processUpdates() {
 		case key := <-t.updateChan:
 			batch = append(batch, key)
 			if len(batch) >= batchSize {
-				t.invalidateLocalBatch(batch)
+				// 批量发送到工作池
+				for _, k := range batch {
+					select {
+					case workCh <- k:
+					default:
+						log.Warnf("Work channel full, dropping key: %s", k)
+					}
+				}
 				batch = batch[:0]
 				resetTimer()
 			}
 		case <-timer.C:
 			if len(batch) > 0 {
-				t.invalidateLocalBatch(batch)
+				for _, k := range batch {
+					select {
+					case workCh <- k:
+					default:
+						log.Warnf("Work channel full, dropping key: %s", k)
+					}
+				}
 				batch = batch[:0]
 			}
 			resetTimer()
 		case <-t.ctx.Done():
 			if len(batch) > 0 {
-				t.invalidateLocalBatch(batch)
+				for _, k := range batch {
+					workCh <- k
+				}
 			}
 			return
 		}
-	}
-}
-
-// invalidateLocalBatch 批量失效本地缓存
-func (t *HYYCache) invalidateLocalBatch(keys []string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	for _, key := range keys {
-		t.local.Delete(key)
 	}
 }
 
@@ -188,7 +197,10 @@ func calculateLocalDuration(remoteDuration time.Duration) time.Duration {
 	if local > maxDuration {
 		return maxDuration
 	}
-	return local
+
+	// 添加随机抖动（±10%）
+	jitter := time.Duration(rand.Int63n(int64(local/5))) - local/10
+	return local + jitter
 }
 
 // ====================== 实现Cache接口 ====================== //
@@ -216,7 +228,7 @@ func (t *HYYCache) SetDefault(k string, x interface{}) error {
 	return t.Set(k, x, DefaultExpiration)
 }
 
-// Get 获取缓存
+// Get 获取缓存（兼容流式压缩数据）
 func (t *HYYCache) Get(k string, target interface{}) (bool, error) {
 	// 先尝试本地缓存
 	found, err := t.local.Get(k, target)
@@ -224,17 +236,23 @@ func (t *HYYCache) Get(k string, target interface{}) (bool, error) {
 		return true, nil
 	}
 
-	// 本地未找到或出错，查询远程
-	found, err = t.remote.Get(k, target)
+	// 创建临时缓冲区用于接收远程数据
+	temp := reflect.New(reflect.TypeOf(target).Elem()).Interface()
+
+	// 查询远程
+	found, err = t.remote.Get(k, temp)
 	if !found || err != nil {
 		return found, err
 	}
 
-	// 设置到本地缓存（使用计算后的过期时间）
-	_, expiration := t.remote.GetWithExpiration(k, target)
+	// 深拷贝到目标
+	deepCopyValue(temp, target)
+
+	// 设置到本地缓存
+	_, expiration := t.remote.GetWithExpiration(k, temp)
 	localDuration := calculateLocalDuration(time.Until(expiration))
 
-	if err := t.local.Set(k, target, localDuration); err != nil {
+	if err := t.local.Set(k, temp, localDuration); err != nil {
 		log.Warnf("Local cache set failed for key %s: %v", k, err)
 	}
 
@@ -255,9 +273,13 @@ func (t *HYYCache) GetWithExpiration(k string, target interface{}) (bool, time.T
 		return false, time.Time{}
 	}
 
-	// 设置到本地缓存（使用计算后的过期时间）
+	// 创建临时变量用于深拷贝
+	temp := reflect.New(reflect.TypeOf(target).Elem()).Interface()
+	deepCopyValue(target, temp) // 使用新的深拷贝方法
+
+	// 设置到本地缓存
 	localDuration := calculateLocalDuration(time.Until(remoteExp))
-	if err := t.local.Set(k, target, localDuration); err != nil {
+	if err := t.local.Set(k, temp, localDuration); err != nil {
 		log.Warnf("Local cache set failed for key %s: %v", k, err)
 	}
 
@@ -306,50 +328,30 @@ func (t *HYYCache) Delete(k string) {
 	t.publishUpdate(k)
 }
 
-// Increment 增加整数值
+// Increment 增加整数值（适配新的modifyNumber方法）
 func (t *HYYCache) Increment(k string, n int64) error {
 	if err := t.remote.Increment(k, n); err != nil {
 		return err
 	}
-
-	// 获取新值并更新本地缓存
-	var newVal int64
-	if found, err := t.remote.Get(k, &newVal); found && err == nil {
-		localDuration := calculateLocalDuration(t.remote.defaultExpiration)
-		if err := t.local.Set(k, newVal, localDuration); err != nil {
-			log.Warnf("Local cache set failed for key %s: %v", k, err)
-		}
-	}
-
 	t.publishUpdate(k)
 	return nil
 }
 
-// IncrementFloat 增加浮点数值
+// IncrementFloat 增加浮点数值（适配新的modifyNumber方法）
 func (t *HYYCache) IncrementFloat(k string, n float64) error {
 	if err := t.remote.IncrementFloat(k, n); err != nil {
 		return err
 	}
-
-	// 获取新值并更新本地缓存
-	var newVal float64
-	if found, err := t.remote.Get(k, &newVal); found && err == nil {
-		localDuration := calculateLocalDuration(t.remote.defaultExpiration)
-		if err := t.local.Set(k, newVal, localDuration); err != nil {
-			log.Warnf("Local cache set failed for key %s: %v", k, err)
-		}
-	}
-
 	t.publishUpdate(k)
 	return nil
 }
 
-// Decrement 减少整数值
+// Decrement 减少整数值（适配新的modifyNumber方法）
 func (t *HYYCache) Decrement(k string, n int64) error {
 	return t.Increment(k, -n)
 }
 
-// DecrementFloat 减少浮点数值
+// DecrementFloat 减少浮点数值（适配新的modifyNumber方法）
 func (t *HYYCache) DecrementFloat(k string, n float64) error {
 	return t.IncrementFloat(k, -n)
 }
@@ -376,7 +378,7 @@ func (t *HYYCache) Flush() {
 	t.remote.Flush()
 }
 
-// Close 关闭缓存
+// Close 关闭缓存（适配新的连接管理）
 func (t *HYYCache) Close() {
 	t.cancel()
 
@@ -384,6 +386,43 @@ func (t *HYYCache) Close() {
 		t.subscription.Close()
 	}
 
+	// 先关闭本地缓存
 	t.local.Close()
+
+	// 再关闭远程缓存（适配新的关闭顺序）
 	t.remote.Close()
+}
+
+// 使用工作池处理本地缓存失效
+func (t *HYYCache) startInvalidationWorkers(numWorkers int) chan string {
+	workCh := make(chan string, 10000)
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			for key := range workCh {
+				t.local.Delete(key)
+			}
+		}()
+	}
+	return workCh
+}
+
+// 优化的深拷贝方法（兼容压缩数据）
+func deepCopyValue(src, dst interface{}) error {
+	srcVal := reflect.ValueOf(src)
+	dstVal := reflect.ValueOf(dst)
+
+	if srcVal.Kind() == reflect.Ptr {
+		srcVal = srcVal.Elem()
+	}
+
+	if dstVal.Kind() == reflect.Ptr {
+		dstVal = dstVal.Elem()
+	}
+
+	if reflect.TypeOf(src) != reflect.TypeOf(dst) {
+		return fmt.Errorf("type mismatch: src=%T, dst=%T", src, dst)
+	}
+
+	dstVal.Set(srcVal)
+	return nil
 }

@@ -32,7 +32,7 @@ func New(defaultExpiration, cleanupInterval time.Duration) Cache {
 
 	switch cacheType {
 	case "memory":
-		return NewMemoryCache(defaultExpiration, cleanupInterval)
+		return NewMemoryCache(defaultExpiration, cleanupInterval, 0, 32, false)
 	case "redis":
 		redisURL := os.Getenv("HYY_CACHE_URL")
 		if redisURL == "" {
@@ -45,7 +45,7 @@ func New(defaultExpiration, cleanupInterval time.Duration) Cache {
 		return cache
 	case "hyy":
 		// 创建本地缓存
-		localCache := NewMemoryCache(defaultExpiration, cleanupInterval)
+		localCache := NewMemoryCache(defaultExpiration, cleanupInterval, 0, 32, false)
 
 		// 创建Redis缓存
 		redisURL := os.Getenv("HYY_CACHE_URL")
@@ -61,6 +61,6 @@ func New(defaultExpiration, cleanupInterval time.Duration) Cache {
 		return NewHYYCache(localCache, remoteCache)
 	default:
 		// 默认使用内存缓存
-		return NewMemoryCache(defaultExpiration, cleanupInterval)
+		return NewMemoryCache(defaultExpiration, cleanupInterval, 0, 32, false)
 	}
 }
