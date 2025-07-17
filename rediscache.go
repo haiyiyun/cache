@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"math/rand"
+
 	"github.com/google/uuid"
 	"github.com/haiyiyun/log"
 	"github.com/redis/go-redis/v9"
@@ -171,6 +173,7 @@ const (
 	lockTimeout                    = 5 * time.Second
 	keyTrackerSet                  = "hyy_cache_keys"
 	defaultRedisPort               = "6379"
+	gzipMagicByte                  = 1 // 压缩标志
 )
 
 // ParseRedisURL 解析Redis连接URL
@@ -354,9 +357,10 @@ func NewRedisCacheFromURL(redisURL string, defaultExpiration time.Duration) (*Re
 func NewRedisCache(options RedisOptions, defaultExpiration time.Duration) (*RedisCache, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	if options.StreamCompressThreshold < 1024*1024 {
-		return nil, errors.New("stream compress threshold too low")
-	}
+	// 移除阈值检查（或调整条件）
+	// if options.StreamCompressThreshold < 1024*1024 {
+	// 	return nil, errors.New("stream compress threshold too low")
+	// }
 
 	// 设置默认选项
 	if options.PoolSize <= 0 {
@@ -446,6 +450,7 @@ func NewRedisCache(options RedisOptions, defaultExpiration time.Duration) (*Redi
 		isSharedDB:              options.IsSharedDB,
 		keyTrackerSet:           options.Namespace + ":" + keyTrackerSet,
 		evictionStop:            make(chan struct{}),
+		activeLocks:             make(map[string]chan struct{}), // 初始化 activeLocks
 		gzipPool: sync.Pool{
 			New: func() interface{} {
 				return new(bytes.Buffer)
@@ -538,7 +543,7 @@ func (c *RedisCache) streamCompress(data []byte) ([]byte, error) {
 		if res == nil {
 			return nil, errors.New("compression failed")
 		}
-		return append([]byte{1}, res...), nil
+		return append([]byte{gzipMagicByte}, res...), nil
 	}
 }
 
@@ -577,69 +582,55 @@ func (c *RedisCache) serialize(item Item) ([]byte, error) {
 		return nil, err
 	}
 
-	if len(data) > c.streamCompressThreshold {
-		compressed, err := c.streamCompress(data)
-		return append([]byte{2}, compressed...), err // 流式压缩标记为2
-	} else if len(data) > c.compressionThreshold {
+	// 压缩处理
+	if c.compression && len(data) > c.compressionThreshold {
+		// 流式压缩大值数据
+		if len(data) > c.streamCompressThreshold {
+			compressed, err := c.streamCompress(data)
+			if err != nil {
+				return nil, err
+			}
+			return append([]byte{gzipMagicByte}, compressed...), nil
+		}
+
+		// 普通压缩
 		compressed, err := c.compress(data)
-		return append([]byte{1}, compressed...), err // 普通压缩标记为1
-	}
-
-	return append([]byte{0}, data...), nil
-}
-
-func (c *RedisCache) deserialize(data []byte) (Item, error) {
-	if len(data) < 1 {
-		return Item{}, errors.New("invalid data length")
-	}
-
-	// 增加大小限制
-	const maxSize = 100 * 1024 * 1024 // 100MB
-	if len(data) > maxSize {
-		return Item{}, errors.New("data exceeds maximum size")
-	}
-
-	flag := data[0]
-	payload := data[1:]
-
-	var err error
-	switch flag {
-	case 1: // 普通压缩
-		payload, err = c.decompress(payload)
-	case 2: // 流式压缩
-		payload, err = c.streamDecompress(payload)
-	default:
-		return Item{}, errors.New("invalid compression flag")
-	}
-
-	if err != nil {
-		return Item{}, err
-	}
-
-	var item Item
-	// 使用安全解码器
-	dec := msgpack.NewDecoder(bytes.NewReader(payload))
-	dec.SetMapDecoder(func(dec *msgpack.Decoder) (interface{}, error) {
-		n, err := dec.DecodeMapLen()
 		if err != nil {
 			return nil, err
 		}
-		m := make(map[string]interface{}, n)
-		for i := 0; i < n; i++ {
-			key, err := dec.DecodeString()
-			if err != nil {
-				return nil, err
-			}
-			value, err := dec.DecodeInterface()
-			if err != nil {
-				return nil, err
-			}
-			m[key] = value
-		}
-		return m, nil
-	})
+		return append([]byte{gzipMagicByte}, compressed...), nil
+	}
 
-	if err := dec.Decode(&item); err != nil {
+	// 未压缩数据直接返回
+	return data, nil
+}
+
+func (c *RedisCache) deserialize(data []byte) (Item, error) {
+	// 检查魔数字节头
+	if len(data) > 0 && data[0] == gzipMagicByte {
+		// 移除魔数字节
+		compressedData := data[1:]
+
+		// 流式解压大值数据
+		if len(compressedData) > c.streamCompressThreshold {
+			decompressed, err := c.streamDecompress(compressedData)
+			if err != nil {
+				return Item{}, fmt.Errorf("stream decompression failed: %w", err)
+			}
+			data = decompressed
+		} else {
+			// 普通解压
+			decompressed, err := c.decompress(compressedData)
+			if err != nil {
+				return Item{}, fmt.Errorf("decompression failed: %w", err)
+			}
+			data = decompressed
+		}
+	}
+
+	// 反序列化
+	var item Item
+	if err := msgpack.Unmarshal(data, &item); err != nil {
 		return Item{}, err
 	}
 	return item, nil
@@ -671,11 +662,19 @@ func (c *RedisCache) compress(data []byte) ([]byte, error) {
 		log.Warnf("高压缩率警告: %.2f (key=%s)", float64(len(compressed))/float64(len(data)), "unknown_key") // 修改为警告日志而非直接报错
 	}
 
-	return append([]byte{1}, compressed...), nil
+	return append([]byte{gzipMagicByte}, compressed...), nil
 }
 
 func (c *RedisCache) decompress(data []byte) ([]byte, error) {
-	buf := bytes.NewBuffer(data)
+	// 检查魔数字节
+	if len(data) < 1 || data[0] != gzipMagicByte {
+		return data, nil
+	}
+
+	// 移除魔数字节头
+	compressedData := data[1:]
+
+	buf := bytes.NewBuffer(compressedData)
 	gz, err := gzip.NewReader(buf)
 	if err != nil {
 		return nil, err
@@ -693,62 +692,105 @@ func (c *RedisCache) decompress(data []byte) ([]byte, error) {
 // 返回cancelFunc必须调用，否则导致协程泄漏
 func (c *RedisCache) acquireLock(lockKey string) (bool, string, context.CancelFunc) {
 	lockValue := uuid.New().String()
-	ok, err := c.client.SetNX(c.ctx, lockKey, lockValue, lockTimeout).Result()
-	if !ok || err != nil {
-		return false, "", nil
+
+	// 使用更可靠的重试机制
+	backoff := 5 * time.Millisecond
+	for i := 0; i < 20; i++ {
+		ok, err := c.client.SetNX(c.ctx, lockKey, lockValue, lockTimeout).Result()
+		if err != nil {
+			log.Warnf("Lock acquisition error: %v", err)
+			continue
+		}
+
+		if ok {
+			stopChan := make(chan struct{})
+			c.activeLocksMutex.Lock()
+			if ch, exists := c.activeLocks[lockKey]; exists {
+				close(ch) // 清理旧锁
+				delete(c.activeLocks, lockKey)
+			}
+			c.activeLocks[lockKey] = stopChan
+			c.activeLocksMutex.Unlock()
+
+			go c.lockRenewer(lockKey, lockValue, stopChan)
+			return true, lockValue, func() { close(stopChan) }
+		}
+
+		// 随机退避减少冲突
+		jitter := time.Duration(rand.Intn(20)) * time.Millisecond
+		time.Sleep(backoff + jitter)
+		backoff = time.Duration(math.Min(float64(backoff*2), float64(100*time.Millisecond)))
 	}
 
-	stopChan := make(chan struct{})
-	c.activeLocksMutex.Lock()
-	if ch, exists := c.activeLocks[lockKey]; exists {
-		close(ch) // 清理旧锁
-		delete(c.activeLocks, lockKey)
-	}
-	c.activeLocks[lockKey] = stopChan
-	c.activeLocksMutex.Unlock()
-
-	// 在锁外启动协程
-	go c.lockRenewer(lockKey, lockValue, stopChan)
-	return true, lockValue, func() { close(stopChan) }
+	return false, "", nil
 }
 
 // 统一数字操作方法
-func (c *RedisCache) modifyNumber(k string, delta interface{}) error {
+func (c *RedisCache) modifyNumber(k string, delta interface{}) (err error) {
 	fullKey := c.generateKey(k)
-	var err error
+	lockKey := c.lockPrefix + fullKey
 
-	switch v := delta.(type) {
+	// 获取锁
+	acquired, lockValue, cancel := c.acquireLock(lockKey)
+	if !acquired {
+		return errors.New("failed to acquire lock")
+	}
+	defer func() {
+		cancel()
+		c.releaseLock(lockKey, lockValue)
+	}()
+
+	// 获取当前值
+	var currentVal interface{}
+	found, err := c.Get(k, &currentVal)
+	if err != nil {
+		return err
+	}
+
+	// 如果不存在，初始化为0
+	if !found {
+		switch delta.(type) {
+		case int64:
+			currentVal = int64(0)
+		case float64:
+			currentVal = 0.0
+		}
+	}
+
+	// 增量计算
+	var newVal interface{}
+	switch d := delta.(type) {
 	case int64:
-		_, err = c.client.IncrBy(c.ctx, fullKey, v).Result()
+		// 确保当前值是int64
+		if cv, ok := currentVal.(int64); ok {
+			newVal = cv + d
+		} else {
+			return errors.New("current value is not int64")
+		}
 	case float64:
-		_, err = c.client.IncrByFloat(c.ctx, fullKey, v).Result()
+		if cv, ok := currentVal.(float64); ok {
+			newVal = cv + d
+		} else {
+			return errors.New("current value is not float64")
+		}
 	default:
 		return errors.New("unsupported number type")
 	}
 
-	if err == nil && c.keyTrackerSet != "" {
-		c.client.SAdd(c.ctx, c.keyTrackerSet, fullKey)
-	}
-	return err
+	// 重新设置值（使用默认过期时间）
+	return c.Set(k, newVal, DefaultExpiration)
 }
 
 // 简化锁续约协程
 func (c *RedisCache) lockRenewer(lockKey, lockValue string, stopChan <-chan struct{}) {
-	defer func() {
-		c.activeLocksMutex.Lock()
-		delete(c.activeLocks, lockKey)
-		c.activeLocksMutex.Unlock()
-	}()
-
 	ticker := time.NewTicker(lockTimeout / 2)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if !c.extendLock(lockKey, lockValue) {
-				return // 续约失败立即退出
-			}
+			// 续约失败时不退出，继续尝试
+			c.extendLock(lockKey, lockValue)
 		case <-stopChan:
 			return
 		case <-c.ctx.Done():
@@ -778,11 +820,10 @@ func (c *RedisCache) releaseLock(lockKey, lockValue string) {
 	script.Run(c.ctx, c.client, []string{lockKey}, lockValue)
 
 	c.activeLocksMutex.Lock()
-	if ch, exists := c.activeLocks[lockKey]; exists {
-		close(ch)
-		delete(c.activeLocks, lockKey)
-	}
-	c.activeLocksMutex.Unlock()
+	defer c.activeLocksMutex.Unlock()
+
+	// 仅删除映射条目，不关闭通道（由cancel函数处理）
+	delete(c.activeLocks, lockKey)
 }
 
 // startEvictionListener 启动键过期事件监听
@@ -1214,6 +1255,11 @@ func (c *RedisCache) Close() {
 
 	// 等待协程退出
 	time.Sleep(100 * time.Millisecond)
+
+	// 触发连接丢失回调（模拟连接丢失）
+	if c.onConnectionLost != nil {
+		c.onConnectionLost(errors.New("cache closed"))
+	}
 
 	// 然后关闭资源
 	close(c.evictionStop)
