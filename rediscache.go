@@ -854,7 +854,11 @@ func (c *RedisCache) checkConnection() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := c.client.Ping(c.ctx).Result(); err != nil {
+			if err := c.client.Ping(c.ctx).Err(); err != nil {
+				if c.onConnectionLost != nil {
+					c.onConnectionLost(fmt.Errorf("connection lost: %w", err))
+				}
+
 				log.Warnf("Redis connection error: %v", err)
 				if err := c.reconnect(); err != nil && c.onConnectionLost != nil {
 					c.onConnectionLost(err)
