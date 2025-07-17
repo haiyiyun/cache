@@ -1086,6 +1086,11 @@ func (c *RedisCache) GetWithExpiration(k string, target interface{}) (bool, time
 		return true, time.Time{}
 	}
 
+	// 处理所有可能的永不过期表示
+	if pttl == -1 || pttl == -2 || pttl == 0 {
+		return true, time.Time{} // 返回零时间表示永不过期
+	}
+
 	if pttl > 0 {
 		return true, time.Now().Add(pttl)
 	}

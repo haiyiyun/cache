@@ -109,7 +109,6 @@ func NewMemoryCache(defaultExpiration, cleanupInterval time.Duration,
 
 	if cleanupInterval > 0 {
 		runJanitor(c, cleanupInterval)
-		runtime.SetFinalizer(C, stopJanitor)
 	}
 
 	return C
@@ -530,13 +529,15 @@ func (c *memorycache) Flush() {
 // Close 安全关闭缓存实例
 // 执行顺序：1.标记关闭 2.停止任务队列 3.等待任务完成 4.停止清理器
 func (m *memorycache) Close() {
-	atomic.StoreInt32(&m.isClosed, 1) // 先标记关闭
-	close(m.evictionWorker)           // 停止任务队列
-	m.wg.Wait()                       // 等待任务完成
+	atomic.StoreInt32(&m.isClosed, 1)
+	close(m.evictionWorker)
+	m.wg.Wait()
 
 	if m.janitor != nil {
-		close(m.janitor.stop) // 最后停janitor
+		// 直接关闭janitor，不再使用终结器
+		close(m.janitor.stop)
 		<-m.janitor.done
+		m.janitor = nil
 	}
 }
 
@@ -578,22 +579,6 @@ func (j *janitor) Run(c *memorycache) {
 			return
 		}
 	}
-}
-
-// stopJanitor 停止清理器的终结器函数
-func stopJanitor(c *MemoryCache) {
-	c.janitor.stop <- true
-}
-
-// runJanitor 启动后台清理器协程
-func runJanitor(c *memorycache, ci time.Duration) {
-	j := &janitor{
-		Interval: ci,
-		stop:     make(chan bool, 1),
-		done:     make(chan bool, 1),
-	}
-	c.janitor = j
-	go j.Run(c)
 }
 
 // getShard 根据键计算哈希选择分片
@@ -684,4 +669,15 @@ func (c *memorycache) HotShards() []int {
 		}
 	}
 	return hotSpots
+}
+
+// runJanitor 启动后台清理器协程
+func runJanitor(c *memorycache, ci time.Duration) {
+	j := &janitor{
+		Interval: ci,
+		stop:     make(chan bool, 1),
+		done:     make(chan bool, 1),
+	}
+	c.janitor = j
+	go j.Run(c)
 }

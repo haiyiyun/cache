@@ -3,6 +3,7 @@ package cache
 import (
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -32,7 +33,19 @@ func New(defaultExpiration, cleanupInterval time.Duration) Cache {
 
 	switch cacheType {
 	case "memory":
-		return NewMemoryCache(defaultExpiration, cleanupInterval, 0, 32, false)
+		shardCount := 32 // 默认值
+		if sc := os.Getenv("HYY_SHARD_COUNT"); sc != "" {
+			if n, err := strconv.Atoi(sc); err == nil {
+				shardCount = n
+			}
+		}
+
+		strictTypeCheck := false
+		if stc := os.Getenv("HYY_STRICT_TYPE_CHECK"); stc != "" {
+			strictTypeCheck = (stc == "true")
+		}
+
+		return NewMemoryCache(defaultExpiration, cleanupInterval, 0, shardCount, strictTypeCheck)
 	case "redis":
 		redisURL := os.Getenv("HYY_CACHE_URL")
 		if redisURL == "" {
@@ -44,8 +57,19 @@ func New(defaultExpiration, cleanupInterval time.Duration) Cache {
 		}
 		return cache
 	case "hyy":
+		shardCount := 32 // 默认值
+		if sc := os.Getenv("HYY_SHARD_COUNT"); sc != "" {
+			if n, err := strconv.Atoi(sc); err == nil {
+				shardCount = n
+			}
+		}
+
+		strictTypeCheck := false
+		if stc := os.Getenv("HYY_STRICT_TYPE_CHECK"); stc != "" {
+			strictTypeCheck = (stc == "true")
+		}
 		// 创建本地缓存
-		localCache := NewMemoryCache(defaultExpiration, cleanupInterval, 0, 32, false)
+		localCache := NewMemoryCache(defaultExpiration, cleanupInterval, 0, shardCount, strictTypeCheck)
 
 		// 创建Redis缓存
 		redisURL := os.Getenv("HYY_CACHE_URL")
@@ -61,6 +85,18 @@ func New(defaultExpiration, cleanupInterval time.Duration) Cache {
 		return NewHYYCache(localCache, remoteCache)
 	default:
 		// 默认使用内存缓存
-		return NewMemoryCache(defaultExpiration, cleanupInterval, 0, 32, false)
+		shardCount := 32 // 默认值
+		if sc := os.Getenv("HYY_SHARD_COUNT"); sc != "" {
+			if n, err := strconv.Atoi(sc); err == nil {
+				shardCount = n
+			}
+		}
+
+		strictTypeCheck := false
+		if stc := os.Getenv("HYY_STRICT_TYPE_CHECK"); stc != "" {
+			strictTypeCheck = (stc == "true")
+		}
+
+		return NewMemoryCache(defaultExpiration, cleanupInterval, 0, shardCount, strictTypeCheck)
 	}
 }

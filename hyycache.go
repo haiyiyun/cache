@@ -333,6 +333,8 @@ func (t *HYYCache) Increment(k string, n int64) error {
 	if err := t.remote.Increment(k, n); err != nil {
 		return err
 	}
+	// 删除本地缓存，强制下次从远程获取最新值
+	t.local.Delete(k)
 	t.publishUpdate(k)
 	return nil
 }
@@ -342,6 +344,8 @@ func (t *HYYCache) IncrementFloat(k string, n float64) error {
 	if err := t.remote.IncrementFloat(k, n); err != nil {
 		return err
 	}
+	// 删除本地缓存，强制下次从远程获取最新值
+	t.local.Delete(k)
 	t.publishUpdate(k)
 	return nil
 }
